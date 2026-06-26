@@ -14,6 +14,7 @@ class RulerPainter:
         self._right_margin = 20
         self._line_y = 80
         self._click_band = 28
+        self._sun_pos = None          # (x, y) of the moving sun (used if needed externally)
 
     def get_input_mask(self, width: int, widget_height: int) -> QRegion:
         y_top = max(0, self._line_y - self._click_band)
@@ -31,24 +32,29 @@ class RulerPainter:
         hours = self.end_hour - self.start_hour + 1
         spacing = (width - left_margin - right_margin) / (hours - 1)
 
-        white_pen = QPen(QColor(255, 255, 255), 2)
-        outline_pen = QPen(QColor(0, 0, 0), 5)
+        # Pens & font
+        ruler_pen = QPen(QColor(80, 80, 80), 2)            # dark grey, no outline
+        tick_pen = QPen(QColor(0, 0, 0), 2)                # black outline for ticks
+        tick_inner = QPen(QColor(255, 255, 255), 1)        # white tick centre
         font = QFont()
         font.setPointSize(11)
         painter.setFont(font)
 
-        painter.setPen(outline_pen)
-        painter.drawLine(left_margin, line_y, width - right_margin, line_y)
-        painter.setPen(white_pen)
+        # ---- Ruler line (simple dark grey) ----
+        painter.setPen(ruler_pen)
         painter.drawLine(left_margin, line_y, width - right_margin, line_y)
 
+        # ---- Hour ticks & labels ----
         for i in range(hours):
             x = left_margin + spacing * i
-            painter.setPen(outline_pen)
+
+            # Tick (black outline + white centre)
+            painter.setPen(tick_pen)
             painter.drawLine(int(x), line_y, int(x), line_y - 8)
-            painter.setPen(white_pen)
+            painter.setPen(tick_inner)
             painter.drawLine(int(x), line_y, int(x), line_y - 8)
 
+            # Text (black outline + white fill)
             text = str(self.start_hour + i)
             painter.setPen(QColor(0, 0, 0))
             for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1),
@@ -57,37 +63,17 @@ class RulerPainter:
             painter.setPen(QColor(255, 255, 255))
             painter.drawText(int(x - 8), line_y + 20, text)
 
+        # ---- Daylight dome, sun, and all time indicators ----
         self._draw_daylight(painter, left_margin, right_margin, line_y, width)
-
-        now = Clock.now()
-        if self.start_hour <= now.hour <= self.end_hour:
-            total_hours = self.end_hour - self.start_hour
-            x = (left_margin
-                 + ((now.hour - self.start_hour) + now.minute / 60)
-                 * (width - left_margin - right_margin) / total_hours)
-            outline_pen.setWidth(7)
-            painter.setPen(outline_pen)
-            painter.drawLine(int(x), line_y - 35, int(x), line_y + 8)
-            white_pen.setWidth(3)
-            painter.setPen(white_pen)
-            painter.drawLine(int(x), line_y - 35, int(x), line_y + 8)
 
     # ───────────────────────────────────────────────────────────────
 
     def _invert_smoothstep(self, u: float) -> float:
-        """
-        Solve t²(3−2t) = u for t via Newton's method.
-
-        Because the Bézier has vertical tangents at both ends, its x-component
-        is x(t) = sx + (ex−sx)·t²(3−2t)  (a smoothstep, not a linear ramp).
-        Without this inversion, t = time_ratio maps to an x that runs ahead of
-        the actual clock position — this corrects that offset.
-        """
         if u <= 0.0:
             return 0.0
         if u >= 1.0:
             return 1.0
-        t = u  # linear first guess
+        t = u
         for _ in range(12):
             ft  = t * t * (3.0 - 2.0 * t)
             dft = 6.0 * t * (1.0 - t)
@@ -125,7 +111,12 @@ class RulerPainter:
         return x, y
 
     def _draw_daylight(self, painter, left_margin, right_margin, line_y, width):
+        """Draw the dome, noon marker, sun (with its vertical line), and purple night line."""
+        self._sun_pos = None   # reset for this frame
+
+        # If we have no sun data at all, just draw the night‑time indicator (purple) if the current time is visible
         if self.sun.sunrise is None or self.sun.sunset is None or self.sun.solar_noon is None:
+            self._draw_night_indicator(painter, left_margin, right_margin, line_y, width)
             return
 
         sunrise_h = self.sun.sunrise.hour + self.sun.sunrise.minute / 60
@@ -146,6 +137,7 @@ class RulerPainter:
 
         h1, h2 = self._bezier_control_heights(sx, ex, nx, sy)
 
+        # ---- Dome arc ----
         dome_path = QPainterPath()
         dome_path.moveTo(sx, sy)
         dome_path.cubicTo(sx, sy - h1, ex, sy - h2, ex, sy)
@@ -159,7 +151,7 @@ class RulerPainter:
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawPath(dome_path)
 
-        # Solar noon diamond at the peak
+        # ---- Solar noon diamond ----
         t0 = (nx - sx) / (ex - sx) if ex != sx else 0.5
         painter.setPen(QPen(QColor(0, 0, 0), 1.5))
         painter.setBrush(QColor(255, 255, 0, 200))
@@ -169,17 +161,23 @@ class RulerPainter:
             QPointF(nx, peak_y + d), QPointF(nx - d, peak_y),
         )
 
-        # Moving sun
+        # ---- Current time indicator ----
         now = Clock.now()
         now_h = now.hour + now.minute / 60 + now.second / 3600
 
+        # Daylight → dotted line from sun to ruler, then sun on top
         if sunrise_h <= now_h <= sunset_h:
-            # u = linear time ratio; invert the smoothstep to get the correct t
             u = (now_h - sunrise_h) / (sunset_h - sunrise_h)
             t = self._invert_smoothstep(u)
             sun_x, sun_y = self._eval_bezier(t, sx, ex, sy, h1, h2)
+            self._sun_pos = (sun_x, sun_y)
 
-            # Color: white → yellow → orange → red  (keyed on linear u, not t)
+            # Draw the dotted line FIRST (so sun covers its endpoint)
+            dot_pen = QPen(QColor(255, 255, 255, 180), 1.5, Qt.PenStyle.DotLine)
+            painter.setPen(dot_pen)
+            painter.drawLine(int(sun_x), int(sun_y), int(sun_x), line_y)
+
+            # Sun colour
             if u <= t0:
                 v = u / t0 if t0 != 0 else 1.0
                 r, g, b = 255, int(255 - 40 * v), int(255 * (1 - v))
@@ -196,4 +194,23 @@ class RulerPainter:
             painter.setBrush(QColor(r, g, b))
             painter.drawEllipse(QPointF(sun_x, sun_y), 7, 7)
 
+        # Night‑time (or outside sunrise→sunset) → purple indicator
+        elif self.start_hour <= now.hour <= self.end_hour:
+            self._draw_night_indicator(painter, left_margin, right_margin, line_y, width)
+
         painter.restore()
+
+    def _draw_night_indicator(self, painter, left_margin, right_margin, line_y, width):
+        """Thin purple vertical line for hours outside daylight, within the displayed range."""
+        now = Clock.now()
+        if not (self.start_hour <= now.hour <= self.end_hour):
+            return
+
+        total_hours = self.end_hour - self.start_hour
+        x = (left_margin
+             + ((now.hour - self.start_hour) + now.minute / 60)
+             * (width - left_margin - right_margin) / total_hours)
+
+        purple_pen = QPen(QColor(128, 0, 128), 2)   # thin, solid, no outline
+        painter.setPen(purple_pen)
+        painter.drawLine(int(x), line_y - 35, int(x), line_y + 8)
